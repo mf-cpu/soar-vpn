@@ -8,6 +8,30 @@ use crate::error::{AppError, AppResult};
 /// /etc/sudoers.d/ 中我们写入的文件名
 const SUDOERS_FILENAME: &str = "wg-vpn";
 
+/// 稳定 helper 路径：sudoers 永久授权这条路径。
+/// App 改名（WG VPN → MaiSui → Soar）或升级都不会让免密失效。
+/// 启动时如果检测到 .app 内的 helper 比这里的新，会自动用 sudo -n 调用
+/// 稳定路径的 install-self 子命令把自己更新到最新版（无密码框）。
+const STABLE_HELPER_DIR: &str = "/Library/Application Support/Soar";
+const STABLE_HELPER_PATH: &str = "/Library/Application Support/Soar/wg-helper.sh";
+
+fn stable_helper_path() -> PathBuf {
+    PathBuf::from(STABLE_HELPER_PATH)
+}
+
+/// 计算文件 sha256（调 /usr/bin/shasum，不引入额外依赖）
+fn sha256_of_file(p: &Path) -> Option<String> {
+    let out = Command::new("/usr/bin/shasum")
+        .args(["-a", "256", p.to_str()?])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    s.split_whitespace().next().map(|s| s.to_string())
+}
+
 #[derive(Debug, Clone)]
 pub struct WgPaths {
     pub wg: PathBuf,
@@ -133,19 +157,87 @@ pub fn passwordless_info(paths: &WgPaths) -> PasswordlessInfo {
         .wg_helper
         .as_ref()
         .map(|p| p.to_string_lossy().to_string());
-    // 用 `sudo -n -l <helper>` 探测当前用户是否可以免密执行 helper。
-    // 不能直接读 /etc/sudoers.d/wg-vpn，因为那是 0440 root:wheel，普通用户没权限。
-    let enabled = match &paths.wg_helper {
-        Some(helper) => can_sudo_n(helper),
-        None => false,
-    };
+    // 免密的判定 = `sudo -n -l <稳定路径>` 成功。
+    // 稳定路径不随 .app 名字 / 安装位置 / 版本变化，所以 sudoers 写一次就永久生效。
+    // 老用户（sudoers 还指向 /Applications/WG VPN.app/...）在这里会显示 enabled=false，
+    // 设置页会引导他重新启用一次（一次密码框），之后就再不会失配。
+    let enabled = can_sudo_n(&stable_helper_path());
     PasswordlessInfo {
         enabled,
         available: paths.wg_helper.is_some(),
-        // authorized_helper 字段仅作为调试信息，读不到就返回 None
         authorized_helper: read_authorized_helper(),
         current_helper: current,
     }
+}
+
+/// 启动时调用：让 /Library/Application Support/Soar/wg-helper.sh 与 .app 内 helper 保持一致。
+/// - 免密未启用 / sudoers 失配：什么都不做（用户在设置里启用免密时会一次性写入）
+/// - sha256 一致：什么都不做
+/// - sha256 不一致 + 免密可用：sudo -n 调稳定路径自身的 install-self（无密码框）
+/// 失败仅 warn，不阻塞启动。
+pub fn sync_stable_helper_if_needed(paths: &WgPaths) {
+    let Some(app_helper) = paths.wg_helper.as_ref() else {
+        return;
+    };
+    let stable = stable_helper_path();
+
+    let app_sha = sha256_of_file(app_helper).unwrap_or_default();
+    let stable_sha = if stable.is_file() {
+        sha256_of_file(&stable).unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    if !app_sha.is_empty() && app_sha == stable_sha {
+        return;
+    }
+
+    if !can_sudo_n(&stable) {
+        log::info!(
+            "稳定 helper 与 .app 不一致（stable_sha={}, app_sha={}），但免密未授权稳定路径，跳过同步。\
+             用户下次在设置启用免密时会自动写入新版本。",
+            if stable_sha.is_empty() { "<missing>" } else { &stable_sha[..8] },
+            if app_sha.is_empty() { "<unknown>" } else { &app_sha[..8] }
+        );
+        return;
+    }
+
+    log::info!(
+        "稳定 helper 已过期（{} → {}），用 sudo -n 自动同步",
+        if stable_sha.is_empty() { "<missing>".into() } else { stable_sha[..8].to_string() },
+        if app_sha.is_empty() { "<unknown>".into() } else { app_sha[..8].to_string() }
+    );
+    let res = Command::new("/usr/bin/sudo")
+        .args([
+            "-n",
+            STABLE_HELPER_PATH,
+            "install-self",
+            &app_helper.to_string_lossy(),
+        ])
+        .output();
+    match res {
+        Ok(o) if o.status.success() => log::info!("稳定 helper 同步完成"),
+        Ok(o) => log::warn!(
+            "稳定 helper 同步失败 status={}: {}",
+            o.status,
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => log::warn!("调用 sudo -n install-self 失败: {}", e),
+    }
+}
+
+/// 选择本次执行的 helper 路径：
+/// - 免密已生效 + 稳定路径文件存在 → 稳定路径（与 sudoers 授权一致，sudo -n 能匹配）
+/// - 否则 → .app 内的 helper（走 osascript 弹密码框，每次操作时认证）
+///
+/// 同时返回是否可以走 sudo -n（免密通道）。
+fn select_helper(paths: &WgPaths) -> Option<(PathBuf, bool)> {
+    let info = passwordless_info(paths);
+    let stable = stable_helper_path();
+    if info.enabled && stable.is_file() {
+        return Some((stable, true));
+    }
+    paths.wg_helper.as_ref().map(|p| (p.clone(), false))
 }
 
 /// 当前用户是否能免密 sudo 执行该路径。
@@ -183,52 +275,76 @@ fn escape_sudoers_path(p: &str) -> String {
     p.replace(' ', "\\ ")
 }
 
-/// 启用免密：写 /etc/sudoers.d/wg-vpn（一次性弹出系统授权框）
+/// 启用免密：一次性 osascript 完成
+///   1. mkdir -p /Library/Application Support/Soar
+///   2. cp .app/wg-helper.sh → /Library/Application Support/Soar/wg-helper.sh
+///   3. chown root:wheel + chmod 0755（任何普通用户改不了，sudo 才认）
+///   4. 写 /etc/sudoers.d/wg-vpn 授权 *稳定路径*（不是 .app 内路径）
+/// 之后无论 .app 怎么重命名 / 升级，sudoers 都不会失配。
 pub fn enable_passwordless(paths: &WgPaths, log_dir: &Path) -> AppResult<PasswordlessInfo> {
     let helper = paths
         .wg_helper
         .as_ref()
         .ok_or_else(|| AppError::Other("当前 App 缺少 wg-helper.sh，无法启用免密".into()))?;
-    let helper_str = helper.to_string_lossy().to_string();
+    let app_helper_str = helper.to_string_lossy().to_string();
     let user = current_user()?;
+
+    // sudoers 授权的是稳定路径（路径里有空格，sudoers 要求 `\ ` 转义）
+    let stable_str = STABLE_HELPER_PATH.to_string();
     let line = format!(
         "{} ALL=(root) NOPASSWD: {}\n",
         user,
-        escape_sudoers_path(&helper_str)
+        escape_sudoers_path(&stable_str)
     );
     let body = format!(
         "# Soar auto-managed. 删除此文件即可恢复每次连接都需要密码。\n\
-         # 授权当前用户免密执行 wg-helper.sh（其内部仅会调用 wg-quick up/down + chmod /var/run/wireguard）。\n\
+         # 授权当前用户免密执行稳定路径下的 wg-helper.sh。\n\
+         # 该路径不随 App 改名 / 升级而变化，所以一次启用永久生效。\n\
          {}",
         line
     );
 
-    let tmp = std::env::temp_dir().join(format!("wg-vpn.sudoers.{}", std::process::id()));
-    std::fs::write(&tmp, body)?;
-    let tmp_str = tmp.to_string_lossy().to_string();
+    let tmp_sudo = std::env::temp_dir().join(format!("wg-vpn.sudoers.{}", std::process::id()));
+    std::fs::write(&tmp_sudo, body)?;
+    let tmp_sudo_str = tmp_sudo.to_string_lossy().to_string();
 
-    // visudo -cf 验证；通过后 chown root:wheel + chmod 0440 + mv 到 sudoers.d
     let target = sudoers_path().to_string_lossy().to_string();
+
+    // 单 osascript 弹一次密码框，把所有事一并做完
+    let q = |s: &str| s.replace('\'', "'\\''");
     let script = format!(
-        "/usr/sbin/visudo -cf '{}' && /usr/sbin/chown root:wheel '{}' && /bin/chmod 0440 '{}' && /bin/mv '{}' '{}'",
-        tmp_str.replace('\'', "'\\''"),
-        tmp_str.replace('\'', "'\\''"),
-        tmp_str.replace('\'', "'\\''"),
-        tmp_str.replace('\'', "'\\''"),
-        target.replace('\'', "'\\''"),
+        "/bin/mkdir -p '{dir}' && \
+         /bin/chmod 0755 '{dir}' && \
+         /bin/cp -f '{src}' '{dst}' && \
+         /usr/sbin/chown root:wheel '{dst}' && \
+         /bin/chmod 0755 '{dst}' && \
+         /usr/sbin/visudo -cf '{tmp}' && \
+         /usr/sbin/chown root:wheel '{tmp}' && \
+         /bin/chmod 0440 '{tmp}' && \
+         /bin/mv '{tmp}' '{sudoers}'",
+        dir = q(STABLE_HELPER_DIR),
+        src = q(&app_helper_str),
+        dst = q(STABLE_HELPER_PATH),
+        tmp = q(&tmp_sudo_str),
+        sudoers = q(&target),
     );
 
-    log::info!("启用免密：写 {} (helper={})", target, helper_str);
+    log::info!(
+        "启用免密：把 {} 安装到 {}，sudoers 授权稳定路径 → {}",
+        app_helper_str,
+        STABLE_HELPER_PATH,
+        target
+    );
     let res = run_admin_osascript(&script, log_dir);
-    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&tmp_sudo);
     res?;
 
     let info = passwordless_info(paths);
     if !info.enabled {
         log::error!(
-            "sudoers 写入后校验未生效：authorized={:?} current={:?}",
+            "sudoers 写入后校验未生效：authorized={:?} stable={}",
             info.authorized_helper,
-            info.current_helper
+            STABLE_HELPER_PATH
         );
         return Err(AppError::Other(
             "sudoers 写入成功但校验未生效，请查看日志".into(),
@@ -237,11 +353,17 @@ pub fn enable_passwordless(paths: &WgPaths, log_dir: &Path) -> AppResult<Passwor
     Ok(info)
 }
 
-/// 关闭免密：删除 /etc/sudoers.d/wg-vpn
+/// 关闭免密：删除 sudoers + 稳定路径下的 helper（彻底清理）
 pub fn disable_passwordless(paths: &WgPaths, log_dir: &Path) -> AppResult<PasswordlessInfo> {
     let target = sudoers_path().to_string_lossy().to_string();
-    let script = format!("/bin/rm -f '{}'", target.replace('\'', "'\\''"));
-    log::info!("关闭免密：删除 {}", target);
+    let q = |s: &str| s.replace('\'', "'\\''");
+    let script = format!(
+        "/bin/rm -f '{}' && /bin/rm -f '{}' && /bin/rmdir '{}' 2>/dev/null || true",
+        q(&target),
+        q(STABLE_HELPER_PATH),
+        q(STABLE_HELPER_DIR),
+    );
+    log::info!("关闭免密：删除 {} 和稳定 helper", target);
     run_admin_osascript(&script, log_dir)?;
     Ok(passwordless_info(paths))
 }
@@ -336,15 +458,12 @@ pub fn run_helper_oneshot(
     action: &str,
     args: &[&str],
 ) -> AppResult<()> {
-    let helper = paths
-        .wg_helper
-        .as_ref()
+    let (helper, use_sudo) = select_helper(paths)
         .ok_or_else(|| AppError::Other("当前 App 缺少 wg-helper.sh".into()))?;
     let helper_str = helper
         .to_str()
         .ok_or_else(|| AppError::Other("helper 路径含非法字符".into()))?;
     let arg_strs: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
-    let info = passwordless_info(paths);
 
     let cmd_log = log_dir.join("wg-quick.log");
     if let Some(parent) = cmd_log.parent() {
@@ -356,7 +475,7 @@ pub fn run_helper_oneshot(
         .open(&cmd_log)?;
     use std::io::Write;
 
-    if info.enabled {
+    if use_sudo {
         let mut sudo_args = vec!["-n".to_string(), helper_str.into(), action.into()];
         sudo_args.extend(arg_strs.iter().cloned());
         let output = Command::new("/usr/bin/sudo").args(&sudo_args).output()?;
@@ -394,9 +513,7 @@ pub fn switch_rules(
     paths: &WgPaths,
     log_dir: &Path,
 ) -> AppResult<()> {
-    let helper = paths
-        .wg_helper
-        .as_ref()
+    let (helper, use_sudo) = select_helper(paths)
         .ok_or_else(|| AppError::Other("当前 App 缺少 wg-helper.sh".into()))?;
     let helper_str = helper
         .to_str()
@@ -404,7 +521,6 @@ pub fn switch_rules(
     let conf_str = conf
         .to_str()
         .ok_or_else(|| AppError::Other("配置路径含非法字符".into()))?;
-    let info = passwordless_info(paths);
 
     let cmd_log = log_dir.join("wg-quick.log");
     if let Some(parent) = cmd_log.parent() {
@@ -416,7 +532,7 @@ pub fn switch_rules(
         .open(&cmd_log)?;
     use std::io::Write;
 
-    if info.enabled {
+    if use_sudo {
         let output = Command::new("/usr/bin/sudo")
             .args(["-n", helper_str, "switch-rules", conf_str, allowed_ips])
             .output()?;
@@ -452,7 +568,9 @@ pub fn switch_rules(
     Ok(())
 }
 
-/// 通用 helper 调用：免密走 sudo -n，否则 osascript
+/// 通用 helper 调用：免密走 sudo -n，否则 osascript。
+/// 注意：传入的 `helper` 参数仅在非免密模式作为 osascript 的执行路径；免密模式
+/// 永远走稳定路径（select_helper 选定）。
 fn run_helper_action(
     helper: &Path,
     action: &str,
@@ -460,8 +578,8 @@ fn run_helper_action(
     paths: &WgPaths,
     log_dir: &Path,
 ) -> AppResult<()> {
-    let info = passwordless_info(paths);
-    let helper_str = helper
+    let (run_helper, use_sudo) = select_helper(paths).unwrap_or_else(|| (helper.to_path_buf(), false));
+    let helper_str = run_helper
         .to_str()
         .ok_or_else(|| AppError::Other("helper 路径含非法字符".into()))?;
     let conf_str = match conf {
@@ -473,7 +591,7 @@ fn run_helper_action(
         None => None,
     };
 
-    if info.enabled {
+    if use_sudo {
         let mut args: Vec<String> = vec!["-n".into(), helper_str.into(), action.into()];
         if let Some(c) = &conf_str {
             args.push(c.clone());
@@ -608,15 +726,13 @@ pub fn down(conf_path: &Path, paths: &WgPaths, log_dir: &Path) -> AppResult<()> 
     run_helper(paths, "down", conf_path, log_dir)
 }
 
-/// 调用 wg-helper.sh：免密模式走 sudo -n；否则走 osascript with administrator privileges。
+/// 调用 wg-helper.sh：免密模式走 sudo -n（用稳定路径）；否则走 osascript with administrator privileges。
 /// 没有 helper 时回退到旧逻辑（直接 osascript 调 wg-quick）。
 fn run_helper(paths: &WgPaths, action: &str, conf: &Path, log_dir: &Path) -> AppResult<()> {
-    if let Some(helper) = &paths.wg_helper {
-        let info = passwordless_info(paths);
-        if info.enabled {
-            return run_sudo_n(helper, action, conf, log_dir);
+    if let Some((helper, use_sudo)) = select_helper(paths) {
+        if use_sudo {
+            return run_sudo_n(&helper, action, conf, log_dir);
         }
-        // 普通模式：osascript 调 helper（一次密码框）
         let helper_str = helper.to_string_lossy();
         let conf_str = conf
             .to_str()

@@ -586,6 +586,10 @@ pub fn run() {
             // 启动时扫描已存在的隧道，恢复 ACTIVE_NAME（避免 App 重启后 UI 显示
             // "未连接" 但实际网卡还在线的误导）
             if let (Ok(dir), Ok(paths)) = (data_dir(app.handle()), wg_paths(app.handle())) {
+                // 启动时把 .app 内最新的 wg-helper.sh 同步到稳定路径，让 sudoers
+                // 永远授权同一个绝对路径，App 改名 / 升级都不会让免密失效。
+                // 已经一致 / 免密未开启时是 no-op，零代价。
+                wg::sync_stable_helper_if_needed(&paths);
                 // 自愈：早期版本（≤0.2.3）的 switch-rules 会把 conf 文件 chown 给 root，
                 // 之后 App 普通进程读不了。这里检测一次，发现就调 helper 修回来。
                 if let Ok(logs) = log_dir(app.handle()) {
@@ -657,8 +661,17 @@ pub fn run() {
             });
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if let tauri::RunEvent::Reopen { .. } = event {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.show();
+                    let _ = w.unminimize();
+                    let _ = w.set_focus();
+                }
+            }
+        });
 }
 
 fn build_tray(app: &AppHandle) -> tauri::Result<()> {
@@ -827,6 +840,24 @@ fn fmt_bps(n: u64) -> String {
     }
 }
 
+/// 紧凑格式：菜单栏 title 显示用，例如 "12K" / "1.2M" / "0B"
+fn fmt_bps_short(n: u64) -> String {
+    let units = ["B", "K", "M", "G"];
+    let mut i = 0;
+    let mut v = n as f64;
+    while v >= 1024.0 && i < units.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if v >= 100.0 || i == 0 {
+        format!("{:.0}{}", v, units[i])
+    } else if v >= 10.0 {
+        format!("{:.0}{}", v, units[i])
+    } else {
+        format!("{:.1}{}", v, units[i])
+    }
+}
+
 /// 流量采样：每秒一次，emit `traffic` 事件 + 更新托盘 tooltip
 fn traffic_loop(app: AppHandle) {
     let paths = match wg_paths(&app) {
@@ -847,6 +878,7 @@ fn traffic_loop(app: AppHandle) {
             let _ = app.emit("traffic", serde_json::json!({"connected": false}));
             if let Some(tray) = app.tray_by_id("main-tray") {
                 let _ = tray.set_tooltip(Some("Soar · 未连接"));
+                let _ = tray.set_title(Some(""));
             }
             continue;
         };
@@ -858,6 +890,7 @@ fn traffic_loop(app: AppHandle) {
             let _ = app.emit("traffic", serde_json::json!({"connected": false}));
             if let Some(tray) = app.tray_by_id("main-tray") {
                 let _ = tray.set_tooltip(Some("Soar · 未连接"));
+                let _ = tray.set_title(Some(""));
             }
             continue;
         }
@@ -904,6 +937,8 @@ fn traffic_loop(app: AppHandle) {
                 fmt_bps(tx_bps),
             );
             let _ = tray.set_tooltip(Some(&tip));
+            let title = format!("↑{} ↓{}", fmt_bps_short(tx_bps), fmt_bps_short(rx_bps));
+            let _ = tray.set_title(Some(&title));
         }
     }
 }

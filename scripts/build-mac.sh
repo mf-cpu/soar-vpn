@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 TARGET=universal-apple-darwin
 APP_NAME="Soar"
-APP_VERSION="0.3.1"
+APP_VERSION=$(node -p "require('./package.json').version")
 DIST_NAME="Soar_${APP_VERSION}.dmg"
 BUNDLE_ROOT="src-tauri/target/$TARGET/release/bundle"
 APP_PATH="$BUNDLE_ROOT/macos/$APP_NAME.app"

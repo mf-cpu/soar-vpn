@@ -353,9 +353,30 @@ case "$ACTION" in
     /bin/chmod -R u+rw "$target_dir"
     echo "ok: chown -R $target_user:staff $target_dir"
     ;;
+  install-self)
+    # 把 .app 内的最新 helper 复制到稳定路径 /Library/Application Support/Soar/wg-helper.sh
+    # sudoers 永久授权稳定路径，App 升级 / 改名都不会让免密失效。
+    # 用法：install-self <src-helper-path>
+    [ -n "$ARG2" ] || { echo "usage: $0 install-self <src-helper-path>" >&2; exit 2; }
+    src="$ARG2"
+    dst="/Library/Application Support/Soar/wg-helper.sh"
+    [ -f "$src" ] || { echo "install-self: src 不存在: $src" >&2; exit 1; }
+    /bin/mkdir -p "/Library/Application Support/Soar"
+    /bin/chmod 0755 "/Library/Application Support/Soar"
+    # 用 .new + mv 原子替换，避免覆盖正在执行的脚本时出问题
+    /bin/cp -f "$src" "${dst}.new"
+    /usr/sbin/chown root:wheel "${dst}.new"
+    /bin/chmod 0755 "${dst}.new"
+    /bin/mv -f "${dst}.new" "$dst"
+    echo "install-self: ok ($dst)"
+    ;;
+  self-sha256)
+    # 让前端 / Rust 端验证稳定路径 helper 的 sha256 是否与 .app 内一致
+    /usr/bin/shasum -a 256 "${BASH_SOURCE[0]}" | /usr/bin/awk '{print $1}'
+    ;;
   *)
     echo "wg-helper: unknown action: $ACTION" >&2
-    echo "usage: $0 {up|down|killswitch-on|killswitch-off|killswitch-status|switch-rules|install-app} [args]" >&2
+    echo "usage: $0 {up|down|killswitch-on|killswitch-off|killswitch-status|switch-rules|install-app|install-self|self-sha256|fix-config-owner} [args]" >&2
     exit 2
     ;;
 esac
