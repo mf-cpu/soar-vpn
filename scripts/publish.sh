@@ -5,9 +5,9 @@
 #   1. 读 package.json 拿 VERSION
 #   2. 算 sha256 + 文件大小
 #   3. 让你写 release notes
-#   4. 生成 latest.json（DMG 下载 URL = GitHub Release）
-#   5. 提示 gh 上传 DMG 到 GitHub Release
-#   6. scp latest.json 到 BCC nginx 目录
+#   4. 生成 latest.json（url=GitHub 主源；mirror_url=自建服务器兜底）
+#   5. gh 上传 DMG 到 GitHub Release
+#   6. scp latest.json + DMG 到 BCC（DMG 仅作兜底镜像，可用 SCP_DMG=0 跳过）
 #
 # 用法：
 #   bash scripts/publish.sh
@@ -60,10 +60,14 @@ echo "    BCC      = $BCC_HOST:$BCC_PATH"
 echo "==> 计算 sha256 / 文件大小"
 SHA=$(/usr/bin/shasum -a 256 "$DMG" | awk '{print $1}')
 SIZE=$(/usr/bin/stat -f%z "$DMG")
+# 主下载 URL：GitHub Release（实测国内直连 ~300 KB/s，比 3Mbps 服务器快 4 倍）
 DMG_URL="https://github.com/${GH_REPO}/releases/download/v${VERSION}/Soar_${VERSION}.dmg"
+# 备用下载 URL：自己服务器（GitHub 偶尔抽风时兜底）
+MIRROR_URL="http://180.76.134.45:8088/wg-vpn/mac/Soar_${VERSION}.dmg"
 echo "    sha256 = $SHA"
 echo "    size   = $SIZE"
 echo "    url    = $DMG_URL"
+echo "    mirror = $MIRROR_URL"
 
 # Release notes
 NOTES_FILE="release/notes-${VERSION}.txt"
@@ -83,6 +87,7 @@ cat > "$MANIFEST" <<EOF
 {
   "version": "${VERSION}",
   "url": "${DMG_URL}",
+  "mirror_url": "${MIRROR_URL}",
   "sha256": "${SHA}",
   "size": ${SIZE},
   "notes": ${NOTES_JSON}
@@ -119,20 +124,30 @@ EOF
     read -p "上传完成后按回车继续 →" _
 fi
 
-# Step 2: 把 manifest 推送到 BCC
+# Step 2: 推送 manifest 到服务器（仅几百字节，秒传）
+#         DMG 走 GitHub Release，服务器只放 latest.json 作为版本通告中心
+#         可选：再 scp 一份 DMG 当兜底镜像（同事 GitHub 抽风时 install.sh 会自动回退）
 echo
 echo "================================================================"
-echo "Step 2: 推送 manifest 到 BCC（${BCC_HOST}）"
+echo "Step 2: 推送 manifest 到服务器"
 echo "================================================================"
 echo "scp $MANIFEST ${BCC_HOST}:${BCC_PATH}latest.json"
 if scp "$MANIFEST" "${BCC_HOST}:${BCC_PATH}latest.json"; then
     echo "✅ manifest 已推送"
 else
-    echo "❌ scp 失败。常见原因："
-    echo "   - 安全组没放行 22 端口"
-    echo "   - ssh 用户名错（默认 root，如果你是 ubuntu 改用 BCC_HOST=ubuntu@180.76.134.45）"
-    echo "   - 第一次连接时需要 ssh-copy-id ${BCC_HOST}（免密）"
+    echo "❌ scp manifest 失败"
     exit 1
+fi
+
+# 可选：把 DMG 也 scp 一份到服务器作为兜底（家用上行慢，但只发一次；同事走 GitHub 主源）
+if [ "${SCP_DMG:-1}" = "1" ]; then
+    echo
+    echo "==> 顺便把 DMG 推一份到服务器当兜底镜像（可设 SCP_DMG=0 跳过）"
+    if scp "$DMG" "${BCC_HOST}:${BCC_PATH}Soar_${VERSION}.dmg"; then
+        echo "✅ 兜底镜像已就位：$MIRROR_URL"
+    else
+        echo "⚠️  DMG scp 失败，但不影响发版（同事走 GitHub 主源即可）"
+    fi
 fi
 
 # Step 3: 验证

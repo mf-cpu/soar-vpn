@@ -43,6 +43,9 @@ if not u:
         if a["name"].endswith(".dmg"):
             u=a["browser_download_url"]; break
 print(u or "")')
+MIRROR_URL=$(echo "$LATEST_JSON" | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+print(d.get("mirror_url") or "")')
 
 [[ -n "$VERSION" && -n "$DMG_URL" ]] || die "拿不到最新版信息，检查网络"
 ok "最新版本：v${VERSION}"
@@ -66,9 +69,16 @@ else
 fi
 
 DMG="/tmp/Soar_${VERSION}.dmg"
-say "下载 DMG ($DMG_URL)…"
-curl -fL --progress-bar -o "$DMG" "$DMG_URL"
-ok "下载完成：$(du -h "$DMG" | awk '{print $1}')"
+say "下载 DMG（GitHub 主源，约 10 MB）…"
+if curl -fL --progress-bar --connect-timeout 8 --max-time 240 -o "$DMG" "$DMG_URL"; then
+  ok "下载完成：$(du -h "$DMG" | awk '{print $1}')"
+elif [[ -n "$MIRROR_URL" ]]; then
+  warn "主源失败，回退备用镜像…"
+  curl -fL --progress-bar --connect-timeout 8 --max-time 300 -o "$DMG" "$MIRROR_URL"
+  ok "下载完成：$(du -h "$DMG" | awk '{print $1}')"
+else
+  die "DMG 下载失败：$DMG_URL"
+fi
 
 say "退出旧版本（如果在跑）…"
 for n in Soar MaiSui "WG VPN"; do
